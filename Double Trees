@@ -1,0 +1,503 @@
+// ==UserScript==
+// @name        Double Trees Logic Puzzle test
+// @namespace   Violentmonkey Scripts
+// @match       https://www.sporcle.com/games/Katie_Wandering/*
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_registerMenuCommand
+// @grant        GM_unregisterMenuCommand
+// ==/UserScript==
+
+// Logging
+let logging = GM_getValue('matchHistory', false);
+GM_registerMenuCommand(`Logging: ${logging ? 'ON' : 'OFF'}`, () => {
+    GM_setValue('matchHistory', (logging = !logging));
+    location.reload();
+});
+
+// Create 10x10 Array Of Colors
+function buildColors(N = 10) {
+    const cells = document.querySelectorAll('.cell > .bg-color');
+    if (cells.length !== N * N) {
+        console.warn(`buildColors: expected ${N * N} cells, found ${cells.length}. Using fallback.`);
+        return fallbackColors(N);
+    }
+
+    const buf = new Uint8Array(N * N);
+    const map = Object.create(null);
+    let count = 0;
+    for (let i = 0; i < N * N; i++) buf[i] = map[cells[i].style.backgroundColor] ??= count++;
+
+    if (count !== 10) {
+        console.warn(`buildColors: expected 10 colors, got ${count}. Using fallback.`);
+        return fallbackColors(N);
+    }
+
+    const grid = new Array(10);
+    for (let r = 0; r < 10; r++) grid[r] = buf.subarray(r * 10, (r + 1) * 10);
+    console.info("buildColors: executed successfully.");
+    console.table(grid);
+    return grid;
+}
+function fallbackColors(N = 10) {
+    const el = document.querySelector('#grid-overlay path');
+    if (!el) throw new Error("fallbackColors: no SVG path found");
+
+    const { x, y, width: w, height: h } = el.getBBox();
+    const sx = w / N, sy = h / N;
+
+    const ctx = document.createElement('canvas').getContext('2d');
+    const p = new Path2D(el.getAttribute('d'));
+
+    // Vertical walls
+    const V = new Array(N);
+    for (let r = 0; r < N; r++) V[r] = new Array(N - 1);
+    for (let row = 0; row < N; row++) {
+        for (let col = 0; col < N - 1; col++) {
+            const midX = x + (col + 1) * sx;
+            const midY = y + (row + 0.5) * sy;
+            V[row][col] = ctx.isPointInStroke(p, midX, midY);
+        }
+    }
+
+    // Horizontal walls
+    const H = new Array(N - 1);
+    for (let r = 0; r < N - 1; r++) H[r] = new Array(N);
+    for (let row = 0; row < N - 1; row++) {
+        for (let col = 0; col < N; col++) {
+            const midX = x + (col + 0.5) * sx;
+            const midY = y + (row + 1) * sy;
+            H[row][col] = ctx.isPointInStroke(p, midX, midY);
+        }
+    }
+
+    function labelRegions(H, V, N = 10) {
+        const UNVISITED = -1;
+        const ids = new Int16Array(N * N).fill(UNVISITED);
+        const idx = (r, c) => r * N + c;
+
+        let regionCount = 0;
+
+        function dfs(r, c) {
+            ids[idx(r, c)] = regionCount;
+
+            if (r > 0     && ids[idx(r - 1, c)] === UNVISITED && !H[r - 1][c]) dfs(r - 1, c);
+            if (r < N - 1 && ids[idx(r + 1, c)] === UNVISITED && !H[r][c])     dfs(r + 1, c);
+            if (c > 0     && ids[idx(r, c - 1)] === UNVISITED && !V[r][c - 1]) dfs(r, c - 1);
+            if (c < N - 1 && ids[idx(r, c + 1)] === UNVISITED && !V[r][c])     dfs(r, c + 1);
+        }
+
+        for (let r = 0; r < N; r++) {
+            for (let c = 0; c < N; c++) {
+                if (ids[idx(r, c)] === UNVISITED) {
+                    dfs(r, c);
+                    regionCount++;
+                }
+            }
+        }
+
+        if (regionCount !== 10) {
+            console.warn(`fallbackColors: expected 10 regions, got ${regionCount}`);
+            return null;
+        }
+
+        // Build row views with subarray (cheap, no copies)
+        const grid = new Array(N);
+        for (let r = 0; r < N; r++) {
+            grid[r] = ids.subarray(r * N, (r + 1) * N);
+        }
+        return grid;
+    }
+
+    const grid = labelRegions(H, V, N);
+    if (!grid) throw new Error("fallbackColors: labeling failed");
+    console.info("fallbackColors: executed successfully.");
+    console.table(grid);
+    return grid;
+}
+const colors = buildColors();
+
+// Direct constraint checks
+function canPlaceT(r, c, board) {
+    if (board[r][c] !== null) return false;
+
+    // Neighbor offsets (8 directions)
+    const DIRECTIONS = [
+        [-1, -1], [-1, 0], [-1, 1],
+        [ 0, -1],          [ 0, 1],
+        [ 1, -1], [ 1, 0], [ 1, 1]
+    ];
+
+    // Adjacency check (8-neighbors)
+    for (const [dr, dc] of DIRECTIONS) {
+        const rr = r + dr,
+            cc = c + dc;
+        if (rr < 0 || rr > 9 || cc < 0 || cc > 9) continue;
+        if (board[rr][cc] === 'T') return false;
+    }
+
+    return true;
+}
+function canPlaceDash(r, c, board) {
+    return board[r][c] === null;
+}
+
+// Placement
+function applyBatteryRule(nextBoard, colorMap, N = 10) {
+    let changedAny = false, changed;
+    do {
+        changed = false;
+
+        for (const axis of ["r", "c"]) {
+            // Build: regionColor -> set of indices (rows or cols) with nulls
+            const spans = new Map();
+            for (let regionColor = 0; regionColor < N; regionColor++) {
+                const idxs = new Set();
+                for (let row = 0; row < N; row++) {
+                    for (let col = 0; col < N; col++) {
+                        if (colorMap[row][col] !== regionColor || nextBoard[row][col] !== null) continue;
+                        idxs.add(axis === "r" ? row : col);
+                    }
+                }
+                if (idxs.size) spans.set(regionColor, idxs);
+            }
+
+            const regionColors = [...spans.keys()];
+            const totalColors = regionColors.length;
+
+            for (let mask = 1; mask < (1 << totalColors); mask++) {
+                const subset = [];
+                for (let k = 0; k < totalColors; k++) {
+                    if (mask & (1 << k)) subset.push(regionColors[k]);
+                }
+                if (subset.length < 2) continue;
+
+                // union of all indices these colors can go in
+                const union = new Set();
+                for (const rc of subset) {
+                    spans.get(rc).forEach(idx => union.add(idx));
+                }
+
+                // Battery condition: need exactly 2 slots per color
+                if (union.size !== subset.length * 2) continue;
+
+                // eliminate other colors from these indices
+                for (const idx of union) {
+                    for (let j = 0; j < N; j++) {
+                        const row = axis === "r" ? idx : j;
+                        const col = axis === "r" ? j   : idx;
+                        if (!subset.includes(colorMap[row][col]) && nextBoard[row][col] === null) {
+                            nextBoard[row][col] = "-";
+                            changed = true;
+                            changedAny = true;
+                        }
+                    }
+                }
+            }
+        }
+    } while (changed);
+
+    return changedAny;
+}
+function placeT(r, c, board) {
+    if (!canPlaceT(r, c, board)) return false;
+
+    const next = board.map(row => row.slice());
+    next[r][c] = 'T';
+
+    // mark neighbors as '-'
+    const DIRECTIONS = [
+        [-1, -1], [-1, 0], [-1, 1],
+        [ 0, -1],          [ 0, 1],
+        [ 1, -1], [ 1, 0], [ 1, 1]
+    ];
+    for (const [dr, dc] of DIRECTIONS) {
+        const rr = r + dr,
+            cc = c + dc;
+        if (rr < 0 || rr > 9 || cc < 0 || cc > 9) continue;
+        if (next[rr][cc] === null) next[rr][cc] = '-';
+    }
+
+    // row/col counts and null slots
+    let rowCount = 0,
+        colCount = 0;
+    const rowNull = [],
+        colNull = [];
+    for (let i = 0; i < 10; i++) {
+        const rv = next[r][i],
+            cv = next[i][c];
+        if (rv === 'T') rowCount++;
+        else if (rv === null) rowNull.push(i);
+        if (cv === 'T') colCount++;
+        else if (cv === null) colNull.push(i);
+    }
+
+    // impossible: too many trees or not enough slots
+    if (rowCount > 2 || colCount > 2) return false;
+    if (rowCount + rowNull.length < 2 || colCount + colNull.length < 2) return false;
+
+    // force placement if only one option remains in row/col
+    if (rowCount === 1 && rowNull.length === 1) return placeT(r, rowNull[0], next);
+    if (colCount === 1 && colNull.length === 1) return placeT(colNull[0], c, next);
+
+    // clean up when row/col is full
+    if (rowCount === 2)
+        for (const j of rowNull) next[r][j] = '-';
+    if (colCount === 2)
+        for (const j of colNull) next[j][c] = '-';
+
+    // --- NEW: region checks ---
+    const color = colors[r][c];
+    let regCount = 0,
+        regNull = [];
+    for (let rr = 0; rr < 10; rr++) {
+        for (let cc = 0; cc < 10; cc++) {
+            if (colors[rr][cc] !== color) continue;
+            const v = next[rr][cc];
+            if (v === 'T') regCount++;
+            else if (v === null) regNull.push([rr, cc]);
+        }
+    }
+
+    // impossible: region already full or cannot be completed
+    if (regCount > 2) return false;
+    if (regCount + regNull.length < 2) return false;
+
+    // force placement: region has exactly 1 null left and needs 1 more tree
+    if (regCount === 1 && regNull.length === 1) {
+        const [rr, cc] = regNull[0];
+        return placeT(rr, cc, next);
+    }
+
+    // clean up: region already has 2 → fill rest with '-'
+    if (regCount === 2) {
+        for (const [rr, cc] of regNull) next[rr][cc] = '-';
+    }
+
+    if (logging) {
+        console.table(next);
+        console.log(`Placed T [${r}][${c}]`);
+    }
+    return next;
+}
+function placeDash(r, c, board) {
+    if (!canPlaceDash(r, c, board)) return false;
+
+    const next = board.map(row => row.slice());
+    next[r][c] = '-';
+    if (logging) {
+        console.table(next);
+        console.log(`Placed Dash [${r}][${c}]`);
+    }
+    return next;
+}
+
+// Validation (need optimization)
+const rowT = new Int8Array(10),
+    rowE = new Int8Array(10),
+    colT = new Int8Array(10),
+    colE = new Int8Array(10),
+    tByColor = new Int8Array(10),
+    eByColor = new Int8Array(10);
+let evaluations = 0;
+
+function analyze(board) {
+    evaluations++;
+    rowT.fill(0);
+    rowE.fill(0);
+    colT.fill(0);
+    colE.fill(0);
+    tByColor.fill(0);
+    eByColor.fill(0);
+
+    let hasEmpty = false;
+
+    // rarity by color
+    const rem = new Uint16Array(128);
+
+    // traversal: counts + remaining empties
+    for (let r = 0; r < 10; r++) {
+        const sr = board[r], cr = colors[r];
+        for (let c = 0; c < 10; c++) {
+            const v = sr[c];
+            if (v === 'T') {
+                rowT[r]++; colT[c]++; tByColor[cr[c]]++;
+            } else if (v === null) {
+                rowE[r]++; colE[c]++; eByColor[cr[c]]++;
+                rem[cr[c]]++; hasEmpty = true;
+            }
+        }
+    }
+
+    // validity checks (prune impossible)
+    for (let i = 0; i < 10; i++) {
+        const rt = rowT[i], re = rowE[i];
+        const ct = colT[i], ce = colE[i];
+        const t  = tByColor[i], e  = eByColor[i];
+
+        if (rt > 2 || ct > 2 || rt + re < 2 || ct + ce < 2) return {score: -Infinity};
+        if ((t | e) && (t > 2 || t + e < 2)) return {score: -Infinity};
+    }
+
+    // complete board
+    if (!hasEmpty) {
+        for (let i = 0; i < 10; i++) {
+            if (rowT[i] !== 2 || colT[i] !== 2 || tByColor[i] !== 2) return {score: -Infinity};
+        }
+        return {score: Infinity};
+    }
+
+    // heuristic penalty (closer to 2 is better)
+    let penalty = 0;
+    for (let i = 0; i < 10; i++) {
+        let t, mask;
+
+        t = rowT[i] - 2;
+        mask = t >> 31;
+        penalty += (t + mask) ^ mask;
+
+        t = colT[i] - 2;
+        mask = t >> 31;
+        penalty += (t + mask) ^ mask;
+
+        t = tByColor[i] - 2;
+        mask = t >> 31;
+        penalty += (t + mask) ^ mask;
+    }
+
+
+    // choose next pick using rarity + degree
+    let best = null, bScore = 1e9, bDeg = -1;
+
+    const deg = (r, c) => {
+        let d = 0;
+        for (let dr = -1; dr <= 1; dr++) {
+            for (let dc = -1; dc <= 1; dc++) {
+                if (dr | dc) {
+                    const rr = r + dr, cc = c + dc;
+                    if (!((rr & ~9) | (cc & ~9)) && board[rr][cc] === null) d++;
+                }
+            }
+        }
+        return d;
+    };
+
+    for (let r = 0; r < 10; r++) {
+        const sr = board[r], cr = colors[r];
+        for (let c = 0; c < 10; c++) {
+            if (sr[c] !== null) continue;
+
+            const dom = (canPlaceT(r, c, board) | 0) + (canPlaceDash(r, c, board) | 0);
+            if (dom === 0) return {score: -Infinity};
+            if (dom === 1) return {score: -penalty, pick: {r, c}}; // forced
+
+            const score = rem[cr[c]];
+            if (score < bScore) {
+                best = [r, c]; bScore = score; bDeg = -1;
+            } else if (score === bScore) {
+                if (bDeg < 0) bDeg = deg(best[0], best[1]);
+                const currentDeg = deg(r, c);
+                if (currentDeg > bDeg) { best = [r, c]; bDeg = currentDeg; }
+            }
+        }
+    }
+
+    return {score: -penalty, pick: best ? {r: best[0], c: best[1]} : null};
+}
+
+function search(board) {
+    const {score, pick} = analyze(board);
+
+    if (score === Infinity) return board;
+    if (score === -Infinity) return null;
+    if (!pick) return null;
+
+    let res = null;
+    let next = placeT(pick.r, pick.c, board);
+    if (next && (res = search(next))) return res;
+
+    next = placeDash(pick.r, pick.c, board);
+    if (next && (res = search(next))) return res;
+
+    return null;
+}
+
+function solve(board) {
+    const solution = search(board);
+    if (!solution) throw new Error("no solution found");
+    console.info("Solution found");
+    console.table(solution);
+    console.log("Evaluations: ", evaluations);
+    return solution;
+}
+
+const board = new Array(10);
+for (let r = 0; r < 10; r++) board[r] = new Array(10).fill(null);
+const solution = solve(board);
+
+async function clickPlay() {
+    const button = document.querySelector("#button-play");
+    if (!button) return;
+
+    const { top, left, width, height } = button.getBoundingClientRect();
+    window.scrollTo({ top: top + window.scrollY - 50 });
+
+    button.dispatchEvent(new MouseEvent('click', {
+        clientX: left + width / 2,
+        clientY: top + height / 2
+    }));
+}
+
+function waitForAnimationFrames(count = 1) {
+    return new Promise(resolve => {
+        function step(frame) {
+            if (frame <= 0) {
+                resolve();
+            } else {
+                requestAnimationFrame(() => step(frame - 1));
+            }
+        }
+        step(count);
+    });
+}
+
+async function simulatePlayAndTypeSolution(solution) {
+  await clickPlay();
+  await waitForAnimationFrames(4);
+
+  for (let row of solution) {
+    for (let ch of row) {
+      document.activeElement.dispatchEvent(new KeyboardEvent("keypress", {
+        key: ch,
+        code: ch === "-" ? "" : "KeyT",
+      }));
+    }
+  }
+}
+
+function addSolveButton() {
+    const btn = document.createElement("button");
+    btn.textContent = "Auto Solve";
+    btn.onclick = () => simulatePlayAndTypeSolution(solution);
+
+    Object.assign(btn.style, {
+        position: "fixed",
+        top: "10px",
+        left: "10px",
+        zIndex: 10000,
+        padding: "6px 12px",
+        background: "#007bff",
+        color: "#fff",
+        border: "none",
+        borderRadius: "6px",
+        font: "14px sans-serif",
+        cursor: "pointer"
+    });
+
+    btn.onmouseover = () => btn.style.background = "#0056b3";
+    btn.onmouseout  = () => btn.style.background = "#007bff";
+
+    document.body.appendChild(btn);
+}
+
+addSolveButton();
