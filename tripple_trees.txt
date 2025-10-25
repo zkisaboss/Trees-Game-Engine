@@ -1,0 +1,700 @@
+// ==UserScript==
+// @name        tripple Trees Logic Puzzle test
+// @namespace   Violentmonkey Scripts
+// @match       https://www.sporcle.com/games/KyleVoge/*
+// @grant       GM_getValue
+// @grant       GM_setValue
+// @grant       GM_registerMenuCommand
+// @grant       GM_unregisterMenuCommand
+// ==/UserScript==
+console.clear();
+
+// Logging
+let logging = GM_getValue('matchHistory', false);
+GM_registerMenuCommand(`Logging: ${logging ? 'ON' : 'OFF'}`, () => {
+    GM_setValue('matchHistory', (logging = !logging));
+    location.reload();
+});
+
+// Create 10x10 Array Of Colors
+function printColorGrid(grid) {
+  const palette = [
+    "🟥","🟧","🟨","🟩","🟦","🟪","⬛","⬜","🟫","🔵",
+    "🔴","🟠","🟡","🟢","🔷","🔶","🟣","⚪","⚫","🟤"
+  ];
+
+  const rows = grid.map(row =>
+    Array.from(row, id => palette[id % palette.length]).join(" ")
+  );
+  console.log(rows.join("\n"));
+}
+function labelRegions(grid) {
+  const R = grid.length;
+  const C = grid[0].length;
+  const visited = Array.from({ length: R }, () => Array(C).fill(false));
+  const directions = [[-1, 0], [1, 0], [0, -1], [0, 1]]; // Up, Down, Left, Right
+  let regionId = 0;
+
+  // Helper function to perform DFS
+  function dfs(x, y, value) {
+    const stack = [[x, y]];
+    visited[x][y] = true;
+    grid[x][y] = regionId; // Assign region number
+
+    while (stack.length > 0) {
+      const [cx, cy] = stack.pop();
+      for (const [dx, dy] of directions) {
+        const nx = cx + dx;
+        const ny = cy + dy;
+        if (nx >= 0 && nx < R && ny >= 0 && ny < C && !visited[nx][ny] && grid[nx][ny] === value) {
+          visited[nx][ny] = true;
+          grid[nx][ny] = regionId; // Assign region number
+          stack.push([nx, ny]);
+        }
+      }
+    }
+  }
+
+  // Iterate over the grid and apply DFS for each unvisited cell
+  for (let i = 0; i < R; i++) {
+    for (let j = 0; j < C; j++) {
+      if (!visited[i][j]) {
+        const value = grid[i][j];  // Current cell value
+        dfs(i, j, value);  // Perform DFS to mark all connected cells with the same value
+        regionId++; // Increment the region id after completing a region
+      }
+    }
+  }
+
+  return grid;
+}
+function buildColors() {
+  const cells = document.querySelectorAll('.cell > .bg-color');
+  const L = cells.length, N = Math.sqrt(L);
+  if (N % 1) throw new Error(`buildColors: invalid N=${N}`);
+
+  // Step 1: Build buffer of color indices
+  const buf = new Uint8Array(L);
+  const map = Object.create(null);
+  let count = 0;
+  for (let i = 0; i < L; i++) buf[i] = map[cells[i].style.backgroundColor] ??= count++;
+
+  // Step 2: Convert buffer to 2D color grid
+  const grid = [];
+  for (let i = 0; i < N; i++) grid.push(buf.slice(i * N, (i + 1) * N));
+
+  // Step 3: Normalize the grid using labelRegions
+  const normalizedGrid = labelRegions(grid); // Label and normalize the regions
+
+  // Step 4: Sanity Checks
+  let regionCount = 0;
+  const regionSizes = {};
+  for (let r = 0; r < N; r++) {
+      const row = normalizedGrid[r];
+      for (let c = 0; c < N; c++) {
+          const id = row[c];
+          regionSizes[id] = (regionSizes[id] ?? 0) + 1;
+          if (id > regionCount) regionCount = id;
+      }
+  }
+  ++regionCount;
+
+  if (regionCount !== N) {
+    console.warn(`Expected ${N} regions, got ${regionCount}. Falling back.`);
+    printColorGrid(normalizedGrid);
+    return fallbackColors(N);
+  }
+
+  if (Object.values(regionSizes).some(size => size < 5)) {
+    console.warn(`Found region(s) smaller than 5 cells. Falling back.`);
+    printColorGrid(normalizedGrid);
+    return fallbackColors(N);
+  }
+
+  console.info("buildColors: executed successfully with labeled regions.");
+  printColorGrid(normalizedGrid);
+  return normalizedGrid;
+}
+function fallbackColors(N) {
+  if (N % 1) throw new Error(`fallbackColors: invalid N=${N}`);
+
+  const el = document.querySelector('#grid-overlay path');
+  if (!el) throw new Error("fallbackColors: no SVG path found");
+
+  const { x, y, width: w, height: h } = el.getBBox();
+  const sx = w / N, sy = h / N;
+
+  const ctx = document.createElement('canvas').getContext('2d');
+  ctx.lineWidth = 4;
+  const p = new Path2D(el.getAttribute('d'));
+
+  // Vertical walls
+  const V = Array.from({ length: N }, () => new Array(N - 1));
+  for (let row = 0; row < N; row++) {
+    for (let col = 0; col < N - 1; col++) {
+      const midX = x + (col + 1)   * sx;
+      const midY = y + (row + 0.5) * sy;
+      V[row][col] = ctx.isPointInStroke(p, midX, midY);
+    }
+  }
+
+  // Horizontal walls
+  const H = Array.from({ length: N - 1 }, () => new Array(N));
+  for (let row = 0; row < N - 1; row++) {
+    for (let col = 0; col < N; col++) {
+      const midX = x + (col + 0.5) * sx;
+      const midY = y + (row + 1)   * sy;
+      H[row][col] = ctx.isPointInStroke(p, midX, midY);
+    }
+  }
+
+  function labelRegions(H, V, N) {
+    const UNVISITED = -1;
+    const ids = new Int32Array(N * N).fill(UNVISITED);
+    const idx = (r, c) => r * N + c;
+
+    let regionCount = 0;
+
+    function dfs(r, c) {
+      ids[idx(r, c)] = regionCount;
+
+      if (r > 0     && ids[idx(r - 1, c)] === UNVISITED && !H[r - 1][c]) dfs(r - 1, c);
+      if (r < N - 1 && ids[idx(r + 1, c)] === UNVISITED && !H[r][c])     dfs(r + 1, c);
+      if (c > 0     && ids[idx(r, c - 1)] === UNVISITED && !V[r][c - 1]) dfs(r, c - 1);
+      if (c < N - 1 && ids[idx(r, c + 1)] === UNVISITED && !V[r][c])     dfs(r, c + 1);
+    }
+
+    for (let r = 0; r < N; r++) {
+      for (let c = 0; c < N; c++) {
+        if (ids[idx(r, c)] === UNVISITED) {
+          dfs(r, c);
+          regionCount++;
+        }
+      }
+    }
+
+    if (regionCount !== N) {
+      throw new Error(`fallbackColors: expected ${N} regions, got ${regionCount}.`);
+    }
+
+    const grid = Array.from({ length: N }, (_, r) => ids.subarray(r * N, r * N + N));
+    return grid;
+  }
+
+  const grid = labelRegions(H, V, N);
+  if (!grid) throw new Error("fallbackColors: labeling failed");
+  console.info("fallbackColors: executed successfully.");
+  printColorGrid(grid);
+  return grid;
+}
+const colors = buildColors();
+const N = colors.length;
+
+// Direct constraint checks
+function canPlaceT(r, c, board) {
+  const hi = board.length - 1;
+  const r0 = r > 0  ? r - 1 : 0, r1 = r < hi ? r + 1 : hi;
+  const c0 = c > 0  ? c - 1 : 0, c1 = c < hi ? c + 1 : hi;
+  for (let i = r0; i <= r1; i++) {
+      const row = board[i];
+      for (let j = c0; j <= c1; j++) {
+          if (row[j] === 'T') return false;
+      }
+  }
+  return true;
+}
+function canPlaceDash(r, c, board) {
+    return board[r][c] === null;
+}
+
+// Placement + Forced Moves
+// Assumes global `colors[r][c]` in 0..N-1
+// colors[r][c] in 0..N-1
+function applyBatteryRule(next) {
+    const N = next.length | 0;
+    const out = next.map(r => r.slice());
+
+    // recompute capacities/needs (only depend on 'T')
+    const rowT = new Int8Array(N), colT = new Int8Array(N), clrT = new Int8Array(N);
+    const rowCap = new Int8Array(N), colCap = new Int8Array(N), need = new Int8Array(N);
+    const recompute = () => {
+        rowT.fill(0); colT.fill(0); clrT.fill(0);
+        for (let r = 0; r < N; r++) {
+            const or = out[r], cr = colors[r];
+            for (let c = 0; c < N; c++) {
+              if (or[c] === 'T') { rowT[r]++; colT[c]++; clrT[cr[c]]++; }
+            }
+        }
+        for (let i = 0; i < N; i++) {
+            rowCap[i] = 3 - rowT[i];
+            colCap[i] = 3 - colT[i];
+            need[i]   = 3 - clrT[i];
+        }
+    };
+
+    // capSum[S] = sum capArr over lines in bitmask S (precompute once per outer iter)
+    const buildCapSum = capArr => {
+        const maxMask = 1 << N, capSum = new Int16Array(maxMask);
+        for (let i = 0; i < N; i++) {
+            const bit = 1 << i, cap = capArr[i] | 0;
+            for (let S = 0; S < maxMask; S += bit << 1) {
+                for (let T = 0; T < bit; T++) capSum[S + bit + T] = capSum[S + T] + cap;
+            }
+        }
+        return capSum;
+    };
+
+    // one pass over row/col dimension (dir=0 rows, dir=1 cols)
+    const tighten = (dir, capSum) => {
+        const max = 1 << N, bitIdx = x => 31 - Math.clz32(x);
+        const maskByColor = new Uint32Array(N);
+
+        // color spans on chosen lines (skip '-')
+        for (let r = 0; r < N; r++) {
+            const or = out[r], cr = colors[r];
+            for (let c = 0; c < N; c++) if (or[c] !== '-') {
+                maskByColor[cr[c]] |= 1 << (dir ? c : r);
+            }
+        }
+
+        // f[S] = sum_{M ⊆ S} needByMask[M]  (SOS DP, in-place)
+        const f = new Int16Array(max);
+        for (let k = 0; k < N; k++) {
+            const n = need[k] | 0, m = maskByColor[k] | 0;
+            if (n > 0 && m) f[m] += n;
+        }
+        for (let b = 1; b < max; b <<= 1)
+            for (let S = 0; S < max; S++) if (S & b) f[S] += f[S ^ b];
+
+        let changed = false;
+        for (let S = 1; S < max; S++) {
+            const needSum = f[S] | 0;
+            if (!needSum) continue;
+            const cap = capSum[S] | 0;
+            if (cap < needSum) return -1;         // impossible
+            if (cap !== needSum) continue;        // not tight
+
+            const notS = ~S;
+            // within lines S, forbid cells whose color span leaks outside S
+            for (let t = S; t; t &= t - 1) {
+                const line = bitIdx(t & -t);
+                for (let i = 0; i < N; i++) {
+                    const r = dir ? i : line, c = dir ? line : i;
+                    if (out[r][c] !== null) continue;
+                    const k = colors[r][c] | 0;
+                    if (need[k] > 0 && (maskByColor[k] & notS)) { out[r][c] = '-'; changed = true; }
+                }
+            }
+        }
+        return changed ? 1 : 0;
+    };
+
+    let mutated;
+    do {
+        recompute();                       // T-dependent state
+        const rowCapSum = buildCapSum(rowCap);
+        const colCapSum = buildCapSum(colCap);
+
+        mutated = false;
+        const a = tighten(0, rowCapSum);   // rows
+        if (a < 0) return null;
+        mutated ||= (a === 1);
+
+        const b = tighten(1, colCapSum);   // cols
+        if (b < 0) return null;
+        mutated ||= (b === 1);
+
+        // if we placed '-', masks change; loop. (caps/needs unchanged since we never place 'T')
+    } while (mutated);
+
+    return out;
+}
+
+var placeTCount = 0;
+function placeT(r, c, board) {
+    // console.table(board);
+    placeTCount++;
+    if (!canPlaceT(r, c, board)) return placeDash(r, c, board);
+
+    let next = board.map(row => row.slice());
+    next[r][c] = "T";
+
+    const N = board.length;
+    const hi = N - 1;
+    const r0 = r > 0  ? r - 1 : 0, r1 = r < hi ? r + 1 : hi;
+    const c0 = c > 0  ? c - 1 : 0, c1 = c < hi ? c + 1 : hi;
+    for (let i = r0; i <= r1; i++) {
+        const row = next[i];
+        for (let j = c0; j <= c1; j++) {
+            if (row[j] === null) next[i][j] = "-";
+        }
+    }
+    // Counts (compact, cache-friendly)
+    const rowT     = new Uint8Array(N), colT = new Uint8Array(N), clrT = new Uint8Array(N);
+    const rowZ     = new Uint8Array(N), colZ = new Uint8Array(N), clrZ = new Uint8Array(N);
+
+    const rowFirst = new Int16Array(N).fill(-1), clrRowFirst = new Int16Array(N).fill(-1);
+    const colFirst = new Int16Array(N).fill(-1), clrColFirst = new Int16Array(N).fill(-1);
+    // ---- Single O(N^2) pass ----
+    for (let i = 0; i < N; i++) {
+        const rowN = next[i], rowC = colors[i];
+        for (let j = 0; j < N; j++) {
+            const v = rowN[j], clr = rowC[j];
+            if (v === 'T' && (++rowT[i] > 3 || ++colT[j] > 3 || ++clrT[clr] > 3)) return false;
+            else if (v === null) {
+                rowZ[i]++; colZ[j]++; clrZ[clr]++;
+                if (rowFirst[i] < 0) rowFirst[i] = j;
+                if (colFirst[j] < 0) colFirst[j] = i;
+                if (clrRowFirst[clr] < 0) { clrRowFirst[clr] = i; clrColFirst[clr] = j; }
+            }
+        }
+    }
+
+    // ---- Forced-placement checks (single loop) ----
+    for (let k = 0; k < N; k++) {
+        const rT = rowT[k], rZ = rowZ[k];
+        const cT = colT[k], cZ = colZ[k];
+        const tT = clrT[k], tZ = clrZ[k];
+
+        if ((rT + rZ) < 3 || (cT + cZ) < 3 || (tT + tZ) < 3) return false;
+
+        const rn = 3 - rT; if (rn === rZ && rZ) return placeT(k, rowFirst[k], next);
+        const cn = 3 - cT; if (cn === cZ && cZ) return placeT(colFirst[k], k, next);
+        const tn = 3 - tT; if (tn === tZ && tZ) return placeT(clrRowFirst[k], clrColFirst[k], next);
+    }
+    return next;
+}
+function placeDash(r, c, board) {
+    if (!canPlaceDash(r, c, board)) return false;
+
+    const next = board.map(row => row.slice());
+    next[r][c] = '-';
+    return next;
+}
+
+// Search
+let evaluations = 0;
+function analyze(board) {
+    evaluations++;
+    const N = board.length;
+
+    const rowT = new Int8Array(N),     rowE = new Int8Array(N),
+          colT = new Int8Array(N),     colE = new Int8Array(N),
+          tByColor = new Int8Array(N), eByColor = new Int8Array(N);
+
+    // counts
+    let empties = false;
+    for (let r = 0; r < N; r++) {
+        const br = board[r], cr = colors[r];
+        for (let c = 0; c < N; c++) {
+            const v = br[c], k = cr[c] | 0;
+            if (v === "T") { rowT[r]++; colT[c]++; tByColor[k]++; }
+            else if (v == null) { rowE[r]++; colE[c]++; eByColor[k]++; empties = true; }
+        }
+    }
+
+    // solved?
+    if (!empties) {
+        for (let i = 0; i < N; i++) {
+            if (rowT[i] !== 3 || colT[i] !== 3 || tByColor[i] !== 3) break;
+            if (i === N - 1) return true;
+        }
+    }
+
+    // Candidate variables
+    let best = null, bestSlack = Number.MAX_VALUE, bestImpact = -1;
+    for (let r = 0; r < N; r++) {
+        const br = board[r], cr = colors[r];
+        const rowSlack = (rowT[r] < 3) ? rowE[r] / (3 - rowT[r]) : Number.MAX_VALUE;
+
+        for (let c = 0; c < N; c++) {
+            if (br[c] !== null) continue;
+
+            // Calculate the minimum slack for this candidate
+            const k = cr[c] | 0;
+            const minSlack = Math.min(
+                rowSlack,
+                (colT[c] < 3)     ? colE[c]     / (3 - colT[c])     : Number.MAX_VALUE,
+                (tByColor[k] < 3) ? eByColor[k] / (3 - tByColor[k]) : Number.MAX_VALUE
+            );
+
+            // Impact calculation: number of null neighbors that would flip to '-'
+            let impact = 0;
+            let r0 = r - 1 < 0 ? 0 : r - 1, r1 = r + 1 >= N ? N - 1 : r + 1;
+            let c0 = c - 1 < 0 ? 0 : c - 1, c1 = c + 1 >= N ? N - 1 : c + 1;
+            for (let i = r0; i <= r1; i++) {
+                const row = board[i];
+                for (let j = c0; j <= c1; j++) {
+                    if (row[j] === null) impact++;
+                }
+            }
+
+            if (minSlack < bestSlack || (minSlack === bestSlack && impact > bestImpact)) {
+                bestSlack = minSlack;
+                bestImpact = impact;
+                best = { r, c };
+            }
+        }
+    }
+
+    return best;
+}
+function search(board) {
+    board = applyBatteryRule(board);
+    if (!board) return null;
+
+    const pick = analyze(board);
+    if (pick === null) return null;
+    if (pick === true) return board;
+
+    let res = null;
+    let next = placeT(pick.r, pick.c, board);
+    if (next && (res = search(next))) return res;
+
+    next = placeDash(pick.r, pick.c, board);
+    if (next && (res = search(next))) return res;
+
+    return null;
+}
+
+// ===== Shape-only keys + reversible value payload (compact 2-bit) =====
+// ---------- 2-bit pack/unpack (reversible) ----------
+function pack(board) {
+    const N = board.length | 0;
+    const total = (N * N) | 0;
+
+    // ---- 1-bit pack: 1='T', 0='-' ----
+    const bodyBytes = (total + 7) >> 3; // 8 cells per byte
+    const body = new Uint8Array(bodyBytes);
+    let out = 0, sh = 0, bi = 0;
+
+    for (let r = 0; r < N; r++) {
+        const row = board[r];
+        for (let c = 0; c < N; c++) {
+            const v = (row[c] === "T") ? 1 : 0; // treat non-'T' as '-'
+            out |= v << sh;
+            if (++sh === 8) { body[bi++] = out; out = 0; sh = 0; }
+        }
+    }
+    if (sh) body[bi] = out;
+
+    // ---- write N as 7-bit varint ----
+    const head = new Uint8Array(3);
+    let n = N, hi = 0;
+    while (n >= 0x80) { head[hi++] = (n & 0x7F) | 0x80; n >>>= 7; }
+    head[hi++] = n;
+
+    // ---- concat head+body ----
+    const buf = new Uint8Array(hi + body.length);
+    buf.set(head.subarray(0, hi), 0);
+    buf.set(body, hi);
+
+    // ---- base64url encode (no padding) ----
+    const ABC = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let s = "", i = 0, len = buf.length;
+    while (i + 2 < len) {
+        const x = (buf[i] << 16) | (buf[i + 1] << 8) | buf[i + 2];
+        s += ABC[(x >>> 18) & 63] + ABC[(x >>> 12) & 63] + ABC[(x >>> 6) & 63] + ABC[x & 63];
+        i += 3;
+    }
+    const rem = len - i;
+    if (rem === 1) {
+        const x = buf[i] << 16;
+        s += ABC[(x >>> 18) & 63] + ABC[(x >>> 12) & 63];
+    } else if (rem === 2) {
+        const x = (buf[i] << 16) | (buf[i + 1] << 8);
+        s += ABC[(x >>> 18) & 63] + ABC[(x >>> 12) & 63] + ABC[(x >>> 6) & 63];
+    }
+    return s;
+}
+function unpack(val) {
+    // base64url -> bytes
+    const b64 = val.replace(/-/g, '+').replace(/_/g, '/').padEnd((val.length + 3) & ~3, '=');
+    const s = atob(b64);
+    const bytes = Uint8Array.from(s, ch => ch.charCodeAt(0) & 255);
+
+    // varint7 for N
+    let i = 0, N = 0, shift = 0, b;
+    do { b = bytes[i++]; N |= (b & 127) << shift; shift += 7; } while (b & 128);
+
+    // unpack 1-bit cells: 1='T', 0='-'
+    const out = Array.from({ length: N }, () => Array(N));
+    let bit = i << 3;
+    for (let r = 0; r < N; r++) {
+        const row = out[r];
+        for (let c = 0; c < N; c++) {
+            const v = (bytes[bit >> 3] >>> (bit & 7)) & 1;
+            row[c] = v ? 'T' : '-';
+            bit++;
+        }
+    }
+    return out;
+}
+// ---------- 2-bit streaming FNV-1a hash of a 0..3 grid (shape, permutation-invariant) ----------
+function hashColorsShape2b(colors2b) {
+  const remap = new Int8Array([-1,-1,-1,-1]);
+  let next = 0;
+  const R = colors2b.length|0, C = colors2b[0].length|0;
+
+  // inline fnv1aInit
+  let h = 0x811c9dc5 >>> 0;
+  let bit = 0, cur = 0;
+
+  for (let r = 0; r < R; r++) {
+      const row = colors2b[r];
+      for (let c = 0; c < C; c++) {
+          let v = row[c] & 3;
+          let m = remap[v];
+          if (m < 0) remap[v] = (m = next++);
+
+          const sh = bit & 7;
+          cur |= (m << sh) & 0xff;
+          bit += 2;
+
+          if ((bit & 7) === 0 || sh > 5) {
+              h ^= cur;
+              h = Math.imul(h, 0x01000193) >>> 0;
+              cur = ((m >>> (8 - sh)) & 0xff) & -(sh > 5);
+          }
+      }
+  }
+
+  if (bit & 7) {
+    h ^= cur;
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+
+  // inline fnv1aHex
+  return h.toString(16).padStart(8, "0");
+}
+// ---------- Four-color (DSATUR on region graph) ----------
+function fourColor(grid) {
+  const R = grid.length|0, C = grid[0].length|0;
+  const id = new Map(); let n = 0;
+  for (let i=0;i<R;i++){ const row=grid[i];
+    for (let j=0;j<C;j++){ const v=row[j]; if(!id.has(v)) id.set(v, n++); }
+  }
+  const adj = Array.from({length:n}, _=>[]);
+  const deg = new Int16Array(n);
+  for (let i=0;i<R;i++){ const row=grid[i];
+    for (let j=0;j<C;j++){
+      const a=id.get(row[j])|0;
+      if (j+1<C){ const b=id.get(row[j+1])|0; if(a!==b){adj[a].push(b);adj[b].push(a);deg[a]++;deg[b]++;} }
+      if (i+1<R){ const b=id.get(grid[i+1][j])|0; if(a!==b){adj[a].push(b);adj[b].push(a);deg[a]++;deg[b]++;} }
+    }
+  }
+  for (let v=0; v<n; v++){
+    const L=adj[v]; if (L.length<2) continue;
+    L.sort((x,y)=>x-y);
+    let w=1; for (let i=1;i<L.length;i++) if (L[i]!==L[i-1]) L[w++]=L[i];
+    L.length=w; deg[v]=w;
+  }
+  const col = new Int8Array(n).fill(-1);
+  const seen = new Uint8Array(n);
+  const SAT  = [0,1,1,2,1,2,2,3,1,2,2,3,2,3,3,4];
+  let s=0, bd=-1; for (let v=0; v<n; v++) if (deg[v]>bd){ bd=deg[v]; s=v; }
+  col[s]=0; for (const u of adj[s]) seen[u]|=1;
+  for (let k=1;k<n;k++){
+    let pick=-1, bs=-1, md=-1;
+    for (let v=0; v<n; v++) if (col[v]<0){
+      const sat=SAT[seen[v]&15], d=deg[v];
+      if (sat>bs || (sat===bs && d>md)) { bs=sat; md=d; pick=v; }
+    }
+    const used=seen[pick]&15, avail=(~used)&15;
+    const c = (avail&1)?0 : (avail&2)?1 : (avail&4)?2 : 3;
+    col[pick]=c; const bit=1<<c;
+    for (const u of adj[pick]) seen[u]|=bit;
+  }
+  return Array.from({length:R}, (_,i)=>{
+    const a = new Int8Array(C), row=grid[i];
+    for (let j=0;j<C;j++) a[j]=col[id.get(row[j])];
+    return a;
+  });
+}
+// ---------- key builder: SHAPE ONLY ----------
+const CACHE_VER = "tt1"; // bump since key format changed
+function keyForShape(board, colorsGrid) {
+    const cols = colorsGrid || (typeof colors !== "undefined" ? colors : null);
+    if (!cols) throw new Error("keyForShape: colors grid required or global `colors` must exist");
+    const c0 = (typeof cols[0][0] === "number" && cols[0][0] >= 0 && cols[0][0] <= 3)
+      ? cols : fourColor(cols);
+    const N = board.length|0;
+    const hShape = hashColorsShape2b(c0);
+    return `${CACHE_VER}:${N}:${hShape}`;
+}
+
+// ---------- solve() using shape-only key and reversible value ----------
+function solve(board, colorsGrid) {
+    const key = keyForShape(board, colorsGrid);
+    console.log(key);
+    const cached = GM_getValue(key, null);
+
+    if (cached) {
+        const solution = unpack(cached);
+        console.info("Cached: ");
+        console.table(solution);
+        addSolveButton();
+        return solution;
+    }
+
+    const solution  = search(board);
+    if (!solution) throw new Error("no solution found");
+
+    GM_setValue(key, pack(solution));
+
+    console.info("Computed: ");
+    console.table(solution);
+    console.log(evaluations);
+    console.log(placeTCount);
+
+    addSolveButton();
+    return solution;
+}
+
+// --- wait & typer ---
+function waitForAnimationFrames(count = 1) {
+  return new Promise(resolve => {
+    function step(n) { n <= 0 ? resolve() : requestAnimationFrame(() => step(n - 1)); }
+    step(count);
+  });
+}
+
+async function simulatePlayAndTypeSolution(sol) {
+  if (!sol) return;
+  document.querySelector("#button-play")?.click();
+  await waitForAnimationFrames(4);
+
+  for (const row of sol) {
+    for (const ch of row) {
+      document.activeElement.dispatchEvent(new KeyboardEvent("keypress", {
+        key: ch,
+        code: ch === "-" ? "" : "KeyT",
+      }));
+    }
+  }
+  // document.querySelector(".play-wrapper")?.click();
+}
+// --- button (takes solution) ---
+async function addSolveButton(sol) {
+  const btn = document.createElement("button");
+  btn.textContent = "Auto Solve";
+  btn.onclick = () => simulatePlayAndTypeSolution(sol);
+
+  Object.assign(btn.style, {
+    position: "fixed", top: "10px", left: "10px", zIndex: 10000,
+    padding: "6px 12px", background: "#007bff", color: "#fff",
+    border: "none", borderRadius: "6px", font: "14px sans-serif", cursor: "pointer"
+  });
+  btn.onmouseover = () => btn.style.background = "#0056b3";
+  btn.onmouseout  = () => btn.style.background = "#007bff";
+
+  document.body.appendChild(btn);
+  // optional auto-run after 2s with the proper arg:
+  await new Promise(r => setTimeout(r, 500));
+  //simulatePlayAndTypeSolution(sol); // uncomment if you want auto-run
+}
+
+// --- run ---
+const board = Array.from({ length: N }, () => Array(N).fill(null));
+const solution = solve(board);
+addSolveButton(solution);
